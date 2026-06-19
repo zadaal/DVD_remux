@@ -27,22 +27,82 @@ import tempfile
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
+try:
+    from tkinterdnd2 import DND_FILES, TkinterDnD
+    _DND_OK = True
+    _BASE = TkinterDnD.Tk
+except Exception:
+    _DND_OK = False
+    _BASE = tk.Tk
+
 VOB_RE = re.compile(r"^VTS_(\d+)_([1-9])\.VOB$", re.IGNORECASE)
 
 
 # --------------------------------------------------------------------------- #
 #  Core scanning / remux logic (no GUI here)
 # --------------------------------------------------------------------------- #
-def find_video_ts(roots):
-    """Yield every VIDEO_TS folder found under the given root paths."""
+def find_discs(roots, report=None):
+    """
+    Yield disc descriptors found under the given roots:
+        {"vob_dir": folder that holds the VOB files,
+         "name":    disc name used for the output file,
+         "root":    folder to feed the dvdvideo demuxer,
+         "structured": True if a real VIDEO_TS subfolder exists}
+    Handles both DVD layouts:
+      * structured -> <disc>/VIDEO_TS/VTS_*.VOB
+      * flattened  -> <disc>/VTS_*.VOB     (DVD files loose in the folder)
+    """
     seen = set()
+
+    def _err(e):
+        if report:
+            report(f"  walk error: {e}")
+
+    def _emit(vob_dir, name, droot, structured):
+        rp = os.path.realpath(vob_dir)
+        if rp in seen:
+            return None
+        seen.add(rp)
+        return {"vob_dir": vob_dir, "name": name or "DVD",
+                "root": droot, "structured": structured}
+
     for root in roots:
-        for dirpath, dirnames, _ in os.walk(root):
-            if os.path.basename(dirpath).upper() == "VIDEO_TS":
-                rp = os.path.realpath(dirpath)
-                if rp not in seen:
-                    seen.add(rp)
-                    yield dirpath
+        root = root.rstrip("/\\") or root
+        if report:
+            report(f"  scanning: {root}")
+        if not os.path.isdir(root):
+            if report:
+                report(f"  NOT a reachable folder: {root}")
+            continue
+        hit = False
+        for dirpath, dirnames, files in os.walk(root, onerror=_err):
+            base = os.path.basename(dirpath).upper()
+            upper = {fn.upper() for fn in files}
+            if base == "VIDEO_TS":
+                disc = os.path.dirname(dirpath)
+                d = _emit(dirpath,
+                          os.path.basename(disc) or os.path.basename(dirpath),
+                          disc, True)
+                if d:
+                    hit = True
+                    yield d
+            elif "VIDEO_TS.IFO" in upper or any(VOB_RE.match(fn) for fn in files):
+                d = _emit(dirpath, os.path.basename(dirpath), dirpath, False)
+                if d:
+                    hit = True
+                    yield d
+        if not hit and report:
+            report(f"  no DVD video found under: {root} -- contents:")
+            try:
+                entries = sorted(os.listdir(root))
+            except OSError as e:
+                report(f"    (cannot list: {e})")
+                entries = []
+            for name in entries[:25]:
+                tag = "DIR " if os.path.isdir(os.path.join(root, name)) else "file"
+                report(f"    {tag} {name}")
+            if len(entries) > 25:
+                report(f"    ... (+{len(entries) - 25} more)")
 
 
 def group_titles(video_ts):
@@ -129,7 +189,7 @@ def enumerate_dvd_titles(ffprobe, disc_root, max_titles=99):
 # --------------------------------------------------------------------------- #
 #  GUI
 # --------------------------------------------------------------------------- #
-class App(tk.Tk):
+class App(_BASE):
     def __init__(self):
         super().__init__()
         self.title("DVD Remux  -  VIDEO_TS to MKV/MP4 (lossless)")
@@ -141,6 +201,8 @@ class App(tk.Tk):
         self.log_q = queue.Queue()
 
         self._build_ui()
+        if not _DND_OK:
+            self._log("Tip: run 'pip install tkinterdnd2' to drag folders onto the list.")
         self.after(100, self._drain_log)
 
     # ----- layout ---------------------------------------------------------- #
@@ -148,10 +210,13 @@ class App(tk.Tk):
         pad = {"padx": 8, "pady": 4}
 
         # Source directories
-        src = ttk.LabelFrame(self, text="1. Source folders (each is searched for VIDEO_TS)")
+        src = ttk.LabelFrame(self, text="1. Source folders - add or drag && drop here (searched for VIDEO_TS)")
         src.pack(fill="x", **pad)
         self.src_list = tk.Listbox(src, height=4, selectmode=tk.EXTENDED)
         self.src_list.pack(side="left", fill="both", expand=True, padx=6, pady=6)
+        if _DND_OK:
+            self.src_list.drop_target_register(DND_FILES)
+            self.src_list.dnd_bind("<<Drop>>", self._on_drop)
         btns = ttk.Frame(src)
         btns.pack(side="right", fill="y", padx=6, pady=6)
         ttk.Button(btns, text="Add folder...", command=self.add_source).pack(fill="x")
@@ -242,6 +307,8 @@ class App(tk.Tk):
         self.run_btn.pack(side="left")
         self.stop_btn = ttk.Button(act, text="Stop", command=self.stop, state="disabled")
         self.stop_btn.pack(side="left", padx=6)
+        self.verify_btn = ttk.Button(act, text="Verify", command=self.verify)
+        self.verify_btn.pack(side="left", padx=6)
         self.prog = ttk.Progressbar(act, mode="determinate")
         self.prog.pack(side="left", fill="x", expand=True, padx=6)
 
@@ -323,6 +390,24 @@ class App(tk.Tk):
         ttk.Button(bar, text="Cancel", command=win.destroy).pack(side="right", padx=6)
         win.grab_set()
 
+    def _on_drop(self, event):
+        """Handle folders dragged from the file manager onto the list."""
+        added = skipped = 0
+        existing = set(self.src_list.get(0, tk.END))
+        for p in self.tk.splitlist(event.data):
+            p = p.strip()
+            if os.path.isdir(p):
+                if p not in existing:
+                    self.src_list.insert(tk.END, p)
+                    existing.add(p)
+                    added += 1
+            else:
+                skipped += 1
+        msg = f"Drag-drop: added {added} folder(s)"
+        if skipped:
+            msg += f", ignored {skipped} non-folder item(s)"
+        self._log(msg)
+
     def remove_source(self):
         for i in reversed(self.src_list.curselection()):
             self.src_list.delete(i)
@@ -337,8 +422,8 @@ class App(tk.Tk):
         if not roots:
             messagebox.showinfo("Scan", "Add at least one source folder first.")
             return
-        found = list(find_video_ts(roots))
-        self._log(f"Scan: found {len(found)} VIDEO_TS folder(s).")
+        found = list(find_discs(roots, report=self._log))
+        self._log(f"Scan: found {len(found)} disc(s).")
         use_dvd = self.use_dvd.get()
         ffprobe = self.ffprobe_var.get().strip()
         threading.Thread(
@@ -346,15 +431,17 @@ class App(tk.Tk):
         ).start()
 
     def _scan_worker(self, found, use_dvd, ffprobe):
-        for vt in found:
-            root = os.path.dirname(vt)
-            if use_dvd:
-                titles = enumerate_dvd_titles(ffprobe, root)
+        for disc in found:
+            name = disc["name"]
+            layout = "structured" if disc["structured"] else "flattened"
+            if use_dvd and disc["structured"]:
+                titles = enumerate_dvd_titles(ffprobe, disc["root"])
                 desc = ", ".join(f"#{t}:{d/60:.0f}m" for t, d in titles) or "none"
-                self._log(f"  {root}  ->  {len(titles)} DVD title(s)  [{desc}]")
+                self._log(f"  {name} [{layout}]  ->  {len(titles)} DVD title(s)  [{desc}]")
             else:
-                sets = group_titles(vt)
-                self._log(f"  {root}  ->  {len(sets)} VTS set(s)")
+                sets = group_titles(disc["vob_dir"])
+                note = "  (flattened: concat only)" if (use_dvd and not disc["structured"]) else ""
+                self._log(f"  {name} [{layout}]  ->  {len(sets)} VTS set(s){note}")
 
     # ----- logging -------------------------------------------------------- #
     def _log(self, msg):
@@ -403,18 +490,25 @@ class App(tk.Tk):
         self.stop_flag.set()
         self._log("Stop requested -- finishing current file...")
 
-    def _build_jobs(self, cfg, video_ts_dirs):
+    def _build_jobs(self, cfg, discs):
         """
         Returns a list of job dicts. Two shapes:
           DVD demuxer : {"kind":"dvd", "root":disc_root, "title":N, "dur":sec, "out":path}
           VOB concat  : {"kind":"concat", "vobs":[...], "dur":sec, "out":path}
+        Flattened discs (no VIDEO_TS subfolder) can't use the dvdvideo demuxer,
+        so they fall back to concat automatically.
         """
         jobs = []
-        for vt in video_ts_dirs:
-            disc_root = os.path.dirname(vt)
-            disc_name = os.path.basename(disc_root) or "DVD"
+        for disc in discs:
+            disc_name = disc["name"]
+            vt = disc["vob_dir"]
+            disc_root = disc["root"]
+            use_dvd = cfg["use_dvd"] and disc["structured"]
+            if cfg["use_dvd"] and not disc["structured"]:
+                self._log(f"  {disc_name}: flattened disc -> concat "
+                          "(chapters not preserved)")
 
-            if cfg["use_dvd"]:
+            if use_dvd:
                 titles = enumerate_dvd_titles(cfg["ffprobe"], disc_root)
                 if not titles:
                     self._log(f"  {disc_name}: dvdvideo demuxer found no titles, skipping")
@@ -483,6 +577,87 @@ class App(tk.Tk):
                 "-map", "0:v?", "-map", "0:a?", "-map", "0:s?",
                 "-dn", "-c", "copy", out]
 
+    def verify(self):
+        """Probe each expected output file and report duration/codecs/tracks."""
+        roots = list(self.src_list.get(0, tk.END))
+        if not roots:
+            messagebox.showinfo("Verify", "Add source folder(s) first.")
+            return
+        cfg = dict(
+            roots=roots, dest=self.dest_var.get().strip(),
+            mode=self.title_mode.get(), min_sec=self.min_min.get() * 60.0,
+            ext="mkv" if self.use_dvd.get() else self.container.get(),
+            use_dvd=self.use_dvd.get(),
+            ffmpeg=self.ffmpeg_var.get().strip(),
+            ffprobe=self.ffprobe_var.get().strip(),
+        )
+        threading.Thread(target=self._verify_worker, args=(cfg,), daemon=True).start()
+
+    @staticmethod
+    def _ffprobe_info(ffprobe, path):
+        """Return (duration_s, 'vcodec WxH', n_audio, n_subs) or None."""
+        import json
+        try:
+            r = subprocess.run(
+                [ffprobe, "-v", "error", "-print_format", "json",
+                 "-show_format", "-show_streams", path],
+                capture_output=True, text=True)
+            if r.returncode != 0:
+                return None
+            d = json.loads(r.stdout)
+        except Exception:
+            return None
+        dur = float(d.get("format", {}).get("duration", 0) or 0)
+        vcodec, w, h, na, ns = "?", 0, 0, 0, 0
+        for st in d.get("streams", []):
+            t = st.get("codec_type")
+            if t == "video" and vcodec == "?":
+                vcodec = st.get("codec_name", "?")
+                w, h = st.get("width", 0), st.get("height", 0)
+            elif t == "audio":
+                na += 1
+            elif t == "subtitle":
+                ns += 1
+        vinfo = f"{vcodec} {w}x{h}" if w else vcodec
+        return dur, vinfo, na, ns
+
+    def _verify_worker(self, cfg):
+        self.verify_btn.config(state="disabled")
+        try:
+            discs = list(find_discs(cfg["roots"], report=self._log))
+            if not discs:
+                self._log("Verify: no DVD video found.")
+                return
+            self._log("Verify: probing expected outputs ...")
+            jobs = self._build_jobs(cfg, discs)
+            ok = miss = bad = 0
+            for job in jobs:
+                out = job["out"]
+                base = os.path.basename(out)
+                if not os.path.exists(out):
+                    self._log(f"  MISSING: {base}")
+                    miss += 1
+                    continue
+                info = self._ffprobe_info(cfg["ffprobe"], out)
+                if not info:
+                    self._log(f"  UNREADABLE: {base}")
+                    bad += 1
+                    continue
+                dur, vinfo, na, ns = info
+                src = job["dur"]
+                size_mb = os.path.getsize(out) / 1e6
+                warn = ""
+                if src and dur and abs(dur - src) / src > 0.02:
+                    warn = f"  <-- source is {src/60:.1f} min, check!"
+                    bad += 1
+                else:
+                    ok += 1
+                self._log(f"  OK {base}: {dur/60:.1f} min, {vinfo}, "
+                          f"{na} audio, {ns} subs, {size_mb:.0f} MB{warn}")
+            self._log(f"Verify done: {ok} good, {miss} missing, {bad} flagged.")
+        finally:
+            self.verify_btn.config(state="normal")
+
     def _run_ffmpeg(self, cmd, dur, base_value):
         """
         Run ffmpeg, parsing its -progress output to drive the progress bar.
@@ -514,14 +689,14 @@ class App(tk.Tk):
     def _run_job(self, cfg):
         try:
             os.makedirs(cfg["dest"], exist_ok=True)
-            video_ts_dirs = list(find_video_ts(cfg["roots"]))
-            if not video_ts_dirs:
-                self._log("No VIDEO_TS folders found.")
+            discs = list(find_discs(cfg["roots"], report=self._log))
+            if not discs:
+                self._log("No DVD video found.")
                 return
 
             mode_lbl = "DVD demuxer (chapters kept)" if cfg["use_dvd"] else "VOB concat"
             self._log(f"Building work list using: {mode_lbl} ...")
-            jobs = self._build_jobs(cfg, video_ts_dirs)
+            jobs = self._build_jobs(cfg, discs)
 
             total = len(jobs)
             self._log(f"Queued {total} title(s) to remux.")
