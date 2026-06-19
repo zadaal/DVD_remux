@@ -558,7 +558,7 @@ class App(_BASE):
         out = job["out"]
         if job["kind"] == "dvd":
             # dvdvideo demuxer: preserves chapters; map A/V/subs only (no data/nav)
-            return [ff, "-hide_banner", "-loglevel", "error", "-y",
+            return [ff, "-hide_banner", "-loglevel", "warning", "-y",
                     "-progress", "pipe:1", "-nostats",
                     "-f", "dvdvideo", "-title", str(job["title"]),
                     "-i", job["root"],
@@ -566,13 +566,15 @@ class App(_BASE):
                     "-dn", "-c", "copy", out]
         # concat mode: exclude DVD data/nav streams that Matroska/MP4 reject
         if cfg["ext"] == "mp4":
-            return [ff, "-hide_banner", "-loglevel", "error", "-y",
+            return [ff, "-hide_banner", "-loglevel", "warning", "-y",
                     "-progress", "pipe:1", "-nostats",
+                    "-analyzeduration", "100M", "-probesize", "100M",
                     "-i", concat_arg(job["vobs"]),
                     "-map", "0:v?", "-map", "0:a?",
                     "-dn", "-sn", "-c", "copy", out]
-        return [ff, "-hide_banner", "-loglevel", "error", "-y",
+        return [ff, "-hide_banner", "-loglevel", "warning", "-y",
                     "-progress", "pipe:1", "-nostats",
+                "-analyzeduration", "100M", "-probesize", "100M",
                 "-i", concat_arg(job["vobs"]),
                 "-map", "0:v?", "-map", "0:a?", "-map", "0:s?",
                 "-dn", "-c", "copy", out]
@@ -740,6 +742,13 @@ class App(_BASE):
                     rc, err = self._run_ffmpeg(cmd, dur, base_value)
                     if rc == 0:
                         self.prog.config(value=done)
+                        for wl in err.strip().splitlines()[:4]:
+                            if wl.strip():
+                                self._log(f"      ffmpeg: {wl.strip()[:200]}")
+                        info = self._ffprobe_info(cfg["ffprobe"], out_path)
+                        if info and dur and info[0] and info[0] < dur * 0.97:
+                            self._log(f"      WARNING: output {info[0]/60:.1f} min < "
+                                      f"source {dur/60:.1f} min -- possible truncation!")
                         self._log(f"      done -> {out_path}")
                     else:
                         self._log(f"      FFMPEG ERROR: {err.strip()[:400]}")
