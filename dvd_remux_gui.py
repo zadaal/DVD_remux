@@ -155,6 +155,7 @@ class App(tk.Tk):
         btns = ttk.Frame(src)
         btns.pack(side="right", fill="y", padx=6, pady=6)
         ttk.Button(btns, text="Add folder...", command=self.add_source).pack(fill="x")
+        ttk.Button(btns, text="Add multiple...", command=self.add_multiple).pack(fill="x", pady=(4, 0))
         ttk.Button(btns, text="Remove", command=self.remove_source).pack(fill="x", pady=4)
         ttk.Button(btns, text="Scan", command=self.scan_sources).pack(fill="x")
 
@@ -272,6 +273,55 @@ class App(tk.Tk):
         d = filedialog.askdirectory(title="Add a source folder")
         if d:
             self.src_list.insert(tk.END, d)
+
+    def add_multiple(self):
+        """Pick a parent folder, then multi-select which subfolders to add."""
+        parent = filedialog.askdirectory(
+            title="Choose a parent folder (you'll pick subfolders next)")
+        if not parent:
+            return
+        try:
+            subs = sorted(d for d in os.listdir(parent)
+                          if os.path.isdir(os.path.join(parent, d)))
+        except OSError as e:
+            messagebox.showerror("Add multiple", str(e))
+            return
+        if not subs:
+            # No subfolders: just add the parent itself (scanned recursively).
+            self.src_list.insert(tk.END, parent)
+            return
+
+        win = tk.Toplevel(self)
+        win.title("Select folders to add")
+        win.geometry("520x380")
+        win.transient(self)
+        ttk.Label(win,
+                  text=f"Subfolders of: {parent}   (Ctrl/Shift-click to select multiple)").pack(
+            anchor="w", padx=8, pady=6)
+        lb = tk.Listbox(win, selectmode=tk.EXTENDED)
+        for d in subs:
+            lb.insert(tk.END, d)
+        lb.pack(fill="both", expand=True, padx=8, pady=4)
+        lb.select_set(0, tk.END)  # default: everything selected
+
+        bar = ttk.Frame(win)
+        bar.pack(fill="x", padx=8, pady=6)
+        ttk.Button(bar, text="Select all",
+                   command=lambda: lb.select_set(0, tk.END)).pack(side="left")
+        ttk.Button(bar, text="Clear",
+                   command=lambda: lb.select_clear(0, tk.END)).pack(side="left", padx=6)
+
+        def do_add():
+            existing = set(self.src_list.get(0, tk.END))
+            for i in lb.curselection():
+                full = os.path.join(parent, subs[i])
+                if full not in existing:
+                    self.src_list.insert(tk.END, full)
+            win.destroy()
+
+        ttk.Button(bar, text="Add selected", command=do_add).pack(side="right")
+        ttk.Button(bar, text="Cancel", command=win.destroy).pack(side="right", padx=6)
+        win.grab_set()
 
     def remove_source(self):
         for i in reversed(self.src_list.curselection()):
